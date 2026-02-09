@@ -48,7 +48,7 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/users`);
       const data = await res.json();
-      setUsers(data);
+      setUsers(Array.isArray(data) ? data : []);
       // If no user selected yet, select the first one
       if (!selectedUser && data.length > 0) setSelectedUser(data[0].username);
     } catch (error) {
@@ -62,8 +62,9 @@ function App() {
       try {
         const res = await fetch(`${API_BASE}/assets`);
         const data = await res.json();
-        setAssets(data);
-        if (data.length > 0) setSelectedAsset(data[0].name);
+        const assetsData = Array.isArray(data) ? data : [];
+        setAssets(assetsData);
+        if (assetsData.length > 0) setSelectedAsset(assetsData[0].name);
       } catch (error) {
         console.error("Failed to fetch assets", error);
       }
@@ -75,9 +76,11 @@ function App() {
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [newUsername, setNewUsername] = useState("");
+  const [modalFeedback, setModalFeedback] = useState(null);
 
   const handleCreateUser = async () => {
     if (!newUsername.trim()) return;
+    setModalFeedback(null);
 
     try {
       const res = await fetch(`${API_BASE}/users`, {
@@ -90,18 +93,22 @@ function App() {
       if (res.ok) {
         await fetchUsers();
         setSelectedUser(newUsername);
-        setMessage({ type: "success", text: `User ${newUsername} created!` });
-        setIsModalOpen(false);
+        // setMessage({ type: "success", text: `User ${newUsername} created!` }); // Optional global toast
+        setModalFeedback({
+          type: "success",
+          text: `User ${newUsername} created! Add another?`,
+        });
         setNewUsername("");
         triggerConfetti();
+        setIsModalOpen(false); // Close modal on success
       } else {
-        setMessage({
+        setModalFeedback({
           type: "error",
           text: data.error || "Failed to create user",
         });
       }
     } catch (error) {
-      setMessage({ type: "error", text: error.message });
+      setModalFeedback({ type: "error", text: error.message });
     }
   };
 
@@ -933,6 +940,19 @@ function App() {
                     className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
                   />
                 </div>
+
+                {modalFeedback && (
+                  <div
+                    className={`p-3 rounded-lg text-sm flex items-center gap-2 ${modalFeedback.type === "success" ? "bg-green-500/10 text-green-400 border border-green-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"}`}
+                  >
+                    {modalFeedback.type === "success" ? (
+                      <Check size={16} />
+                    ) : (
+                      <X size={16} />
+                    )}
+                    <span className="flex-1">{modalFeedback.text}</span>
+                  </div>
+                )}
 
                 <button
                   onClick={handleCreateUser}

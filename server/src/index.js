@@ -1,14 +1,37 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+
+// Initialize dotenv FIRST before importing anything else
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+
 import connectDB from './db.js';
+
 import { User, AssetType, Wallet, Transaction } from './models/index.js';
 import { z } from 'zod';
 import mongoose from 'mongoose';
 
-dotenv.config();
+// Connect to MongoDB and Seed if Empty
 
-connectDB();
+connectDB().then(async () => {
+    try {
+        const count = await AssetType.countDocuments();
+        if (count === 0) {
+            console.log('No assets found. Seeding default assets...');
+            await AssetType.create([
+                { name: 'Gold Coins', description: 'Main in-game currency' },
+                { name: 'Reward Points', description: 'Loyalty points' }
+            ]);
+            console.log('Default assets created: Gold Coins, Reward Points');
+        }
+    } catch (err) {
+        console.error('Failed to check/seed assets:', err);
+    }
+});
 
 const app = express();
 app.use(cors());
@@ -16,18 +39,15 @@ app.use(express.json());
 
 // Schema Validation
 const TransactionSchema = z.object({
-    userId: z.string(), // Can be username or ID
+    userId: z.string(),
     assetType: z.string(),
     amount: z.number().positive(),
-    idempotencyKey: z.string().uuid(), // Or just string if client generates non-uuid
+    idempotencyKey: z.string().uuid(),
     description: z.string().optional(),
 });
 
-// Helper: Seed Database (Expose as API endpoint too)
 app.post('/api/seed', async (req, res) => {
-    // In production this should be protected
-    // For now we'll just shell out to the seed script via child_process or reproduce logic here
-    // Reproducing logic is safer/cleaner
+
     try {
         await User.deleteMany({});
         await AssetType.deleteMany({});
@@ -52,11 +72,9 @@ app.post('/api/seed', async (req, res) => {
     }
 });
 
-// Helper: Get User and Asset IDs
 async function resolveUserAndAsset(userIdOrName, assetTypeName) {
     let user = await User.findOne({ username: userIdOrName });
     if (!user) {
-        // Try as objectId
         if (mongoose.Types.ObjectId.isValid(userIdOrName)) {
             user = await User.findById(userIdOrName);
         }
@@ -69,7 +87,6 @@ async function resolveUserAndAsset(userIdOrName, assetTypeName) {
     return { user, asset };
 }
 
-// Core Transaction Logic with Fallback for Standalone Mongo
 async function processTransaction(req, res, type) {
     const validation = TransactionSchema.safeParse(req.body);
     if (!validation.success) {
@@ -78,15 +95,12 @@ async function processTransaction(req, res, type) {
 
     const { userId, assetType, amount, idempotencyKey, description } = validation.data;
 
-    // Helper to execute operation
     const executeOperation = async (session = null) => {
-        // 1. Check Idempotency
         const existingTx = await Transaction.findOne({ idempotencyKey }).session(session);
         if (existingTx) {
             return { status: 200, json: { message: 'Transaction already processed', txId: existingTx._id } };
         }
 
-        // 2. Resolve Entities
         let user = await User.findOne({ username: userId }).session(session);
         if (!user && mongoose.Types.ObjectId.isValid(userId)) {
             user = await User.findById(userId).session(session);
@@ -96,22 +110,12 @@ async function processTransaction(req, res, type) {
         const asset = await AssetType.findOne({ name: assetType }).session(session);
         if (!asset) throw new Error('Asset type not found');
 
-        // 3. Update Wallet Balance ATOMICALLY
-        // Using findOneAndUpdate ensures atomic updates even without transactions (for balance)
-        // Upsert logic: If wallet doesn't exist, create it.
-        // Ideally we lock, but atomic update is better.
-
-        // Calculate delta
         let delta = 0;
         if (type === 'TOPUP' || type === 'BONUS') {
             delta = amount;
         } else if (type === 'SPEND') {
             delta = -amount;
         }
-
-        // Spend check logic inside query?
-        // If SPEND, we require balance >= amount. 
-        // We can use query condition: { balance: { $gte: amount } }
 
         const filter = { user: user._id, assetType: asset._id };
         if (type === 'SPEND') {
@@ -121,11 +125,6 @@ async function processTransaction(req, res, type) {
         const update = { $inc: { balance: delta }, $setOnInsert: { user: user._id, assetType: asset._id } };
         const options = { new: true, upsert: true, session };
 
-        // If SPEND and wallet doesn't exist (balance 0), upsert with negative balance? No.
-        // If SPEND, we must ensure it exists OR handle "upsert with 0 balance" logic.
-        // Actually if wallet doesn't exist, balance is 0. Spend fails.
-        // So for SPEND, do NOT upsert if not exists? Or upsert but check result.
-
         if (type === 'SPEND') {
             options.upsert = false; // Cannot spend from non-existent wallet
         }
@@ -133,19 +132,15 @@ async function processTransaction(req, res, type) {
         let wallet = await Wallet.findOneAndUpdate(filter, update, options);
 
         if (!wallet) {
-            // If SPEND failed, it implies insufficient funds OR wallet not found.
             if (type === 'SPEND') {
-                // Check if wallet exists at all to give better error
                 const w = await Wallet.findOne({ user: user._id, assetType: asset._id }).session(session);
                 if (!w || w.balance < amount) {
                     throw new Error('Insufficient funds');
                 }
             }
-            // Should not happen for TOPUP/BONUS with upsert true
             throw new Error('Wallet update failed');
         }
 
-        // 4. Record Transaction
         const tx = new Transaction({
             wallet: wallet._id,
             amount: delta,
@@ -166,7 +161,6 @@ async function processTransaction(req, res, type) {
         };
     };
 
-    // Try with Transaction first (ACID compliance)
     const session = await mongoose.startSession();
     try {
         session.startTransaction();
@@ -176,11 +170,9 @@ async function processTransaction(req, res, type) {
     } catch (error) {
         try { await session.abortTransaction(); } catch (e) { /* ignore abort error */ }
 
-        // Check if error is due to missing Replica Set (Standalone Mongo)
         if (error.message.includes('Transaction numbers are only allowed') || error.message.includes('Sessions are not supported')) {
             console.warn('MongoDB Transaction failed (Standalone?), retrying without transaction...');
             try {
-                // Retry WITHOUT session (Atomic updates still safety)
                 const result = await executeOperation(null);
                 res.status(result.status).json(result.json);
             } catch (retryError) {
